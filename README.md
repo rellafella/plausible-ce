@@ -34,9 +34,10 @@
     $ cd plausible-ce
 
     $ ls -1
-    README.md
     clickhouse/
     compose.yml
+    LICENSE
+    README.md
     ```
 
 1. Create and configure your [environment](https://docs.docker.com/compose/environment-variables/) file:
