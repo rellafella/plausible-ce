@@ -23,7 +23,7 @@
 1. Clone this repository:
 
     ```console
-    $ git clone -b v3.0.1 --single-branch https://github.com/plausible/community-edition plausible-ce
+    $ git clone -b v3.1.0 --single-branch https://github.com/plausible/community-edition plausible-ce
     Cloning into 'plausible-ce'...
     remote: Enumerating objects: 13, done.
     remote: Counting objects: 100% (10/10), done.
