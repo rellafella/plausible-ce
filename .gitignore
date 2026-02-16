@@ -1,9 +1,14 @@
-*
-!compose.yml
-!clickhouse/logs.xml
-!clickhouse/ipv4-only.xml
-!clickhouse/low-resources.xml
-!clickhouse/default-profile-low-resources-overrides.xml
-!README.md
-!LICENSE
-!.gitignore
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/*
+
+# Backups
+backups/*

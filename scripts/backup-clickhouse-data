@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+# confirm that use is root or sudo, if not exit
+if [ "$EUID" -ne 0 ]
+  then echo "Please run as root or with sudo"
+  exit
+fi
+
+# Get the directory of the script
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+# Get the dir 1 level up
+DIR="$(dirname "$DIR")"
+
+# Load the environment variables
+source "$DIR/.env"
+
+REQUIRED_VARS=(
+  LOCAL_BACKUP_PATH
+  LOCAL_CLICKHOUSE_BACKUP_PATH
+  LOGS_PATH
+)
+
+for var in "${REQUIRED_VARS[@]}"; do
+  if [ -z "${!var}" ] || [ "${!var}" = "REPLACE_ME" ]; then
+    echo "$var is unset. Please set this in your .env file." 
+    exit 1
+  fi
+done
+
+# log file + backup path
+LOG_FILE="${LOGS_PATH}plausible-backup-clickhouse-data.log"
+BACKUP_PATH=${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH}
+
+# function to log messages
+log_message() {
+  local log_dir=$(dirname "$LOG_FILE")
+  local log_file=$(basename "$LOG_FILE")
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  local message="${1//[$'\n']/}" # Remove newline characters from the message
+  local level="${2:-INFO}" # Optional log level
+
+  # Create the log directory if it doesn't exist
+  if [ ! -d "$log_dir" ]; then
+    mkdir -p "$log_dir"
+  fi
+
+  # Create the log file if it doesn't exist
+  if [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE"
+  fi
+
+  echo "$timestamp - [$level] $message" >> "$LOG_FILE"
+}
+
+# Create the local backup directory if is does not exist
+mkdir -p ${BACKUP_PATH}
+
+# create a timestamp variable
+timestamp=$(date +%Y-%m-%d-%H-%M-%S)
+
+
+# Define the container name
+# Look for POSTGRES_CONTAINER_NAME and set to default if not found
+if [ -z ${CLICKHOUSE_CONTAINER_NAME+x} ]; then
+    CLICKHOUSE_CONTAINER_NAME="analytics-plausible_events_db-1"
+fi
+
+CONTAINER_NAME=${CLICKHOUSE_CONTAINER_NAME}
+
+# Look for env LOCAL_BACKUP_RETENTION_DAYS and set default if not found
+if [ -z ${LOCAL_BACKUP_RETENTION_DAYS+x} ]; then
+    LOCAL_BACKUP_RETENTION_DAYS=7
+fi
+
+# clickhouse-client --query "BACKUP DATABASE plausible_events_db TO Disk('backups', 'plausible_events_db_backup.zip')"
+docker exec $CONTAINER_NAME clickhouse-client --query "BACKUP DATABASE plausible_events_db TO Disk('backups', 'plausible_events_db_backup_${timestamp}.zip')"
+
+
+# Copy the backup filec from Docker container to the server
+log_message "Copying the backup file, plausible_events_db_backup_${timestamp}.zip, from Docker container to the local backup directory."
+docker cp $CONTAINER_NAME:/backups/plausible_events_db_backup_${timestamp}.zip ${BACKUP_PATH}plausible_events_db_backup_${timestamp}.zip
+
+## check for success
+if [ $? -eq 0 ]; then
+  log_message "Successfully copied up the Plausible Event database to ${BACKUP_PATH}plausible_events_db_backup_${timestamp}.zip."
+else
+  log_message "Failed to copy the Plausible Event database." "ERROR"
+  exit 1
+fi
+
+# Remove the backup file from inside the Docker container
+log_message "Removing the backup file, plausible_events_db_backup_${timestamp}.zip, from inside the Docker container."
+docker exec $CONTAINER_NAME /bin/bash -c "rm ./backups/plausible_events_db_backup_${timestamp}.zip"
+
+log_message 'Pruning old Plausible Event database backups to max age of '${LOCAL_BACKUP_RETENTION_DAYS}' days.'
+find ${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH} -type f -mtime +${LOCAL_BACKUP_RETENTION_DAYS} -exec rm {} \;
+
+# change the ownership of the created backup files to the specified user
+log_message "Changing the ownership of the created backup files to the ${LOCAL_USER:-forge} user."
+chown -R ${LOCAL_USER:-forge}:${LOCAL_GROUP:-forge} ${LOCAL_BACKUP_PATH}
+
+# check for success
+if [ $? -eq 0 ]; then
+    log_message "Successfully backed up the Plausible Event database to ${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH}."
+else
+    log_message "Failed to backup the Plausible Event database." "ERROR"
+    exit 1
+fi

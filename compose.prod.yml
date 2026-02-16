@@ -1,0 +1,35 @@
+services:
+  plausible_db:
+    networks:
+      - default
+
+  plausible_events_db:
+    networks:
+      - default
+
+  plausible:
+    # Note that this adds the "proxy" network to the container so that Traefik can route to it
+    networks:
+      - default
+      - proxy
+    ports: []
+    labels:
+      # Enable Traefik for this container
+      traefik.enable: "true"
+
+      # HTTP Router
+      traefik.http.routers.plausible.rule: "Host(`${URL_FOR_TRAEFIK}`)"
+      traefik.http.routers.plausible.entrypoints: "websecure"
+      traefik.http.routers.plausible.tls: "true"
+      # The certificate resolver is the one defined in the Traefik configuration, i.e. 'leresolver'
+      traefik.http.routers.plausible.tls.certresolver: "leresolver"
+
+      # Service
+      traefik.http.services.plausible.loadbalancer.server.port: "8000"
+      traefik.docker.network: "proxy"
+
+# The network used for Traefik is "proxy". Also defined is a "default" network for the other Plausible services to use for internal communication.
+networks:
+  default:
+  proxy:
+    external: true

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+
+# *This file is meant to be run as root or with sudo*
+# It will transfer local backups of clickhouse data and postgres to an s3 bucket
+# It requires root or sudo to write logs
+# The script is intended to be run as a cron job
+
+# confirm that use is root or sudo, if not exit
+if [ "$EUID" -ne 0 ]
+  then echo "Please run as root or with sudo"
+  exit
+fi
+
+# Get the directory of the script
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+# Get the dir 1 level up
+DIR="$(dirname "$DIR")"
+
+# Load the environment variables
+source "$DIR/.env"
+
+REQUIRED_VARS=(
+  LOCAL_BACKUP_PATH
+  LOCAL_POSTGRES_BACKUP_PATH
+  LOCAL_CLICKHOUSE_BACKUP_PATH
+  LOCAL_BACKUP_RETENTION_DAYS
+  S3_BUCKET_NAME
+  S3_BUCKET_REGION
+  S3_ACCESS_KEY_ID
+  S3_SECRET_ACCESS_KEY
+  LOGS_PATH
+)
+
+for var in "${REQUIRED_VARS[@]}"; do
+  if [ -z "${!var}" ] || [ "${!var}" = "REPLACE_ME" ]; then
+    echo "$var is unset. Please set this in your .env file." 
+    exit 1
+  fi
+done
+
+# set backup paths
+S3_CLICKHOUSE_PATH="s3://${S3_BUCKET_NAME}/plausible/clickhouse-data/"
+S3_POSTGRES_PATH="s3://${S3_BUCKET_NAME}/plausible/postgres-data/"
+
+# log file
+LOG_FILE="${LOGS_PATH}plausible-backup-to-s3.log"
+
+# function to log messages
+log_message() {
+  local log_dir=$(dirname "$LOG_FILE")
+  local log_file=$(basename "$LOG_FILE")
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  local message="${1//[$'\n']/}" # Remove newline characters from the message
+  local level="${2:-INFO}" # Optional log level
+
+  # Create the log directory if it doesn't exist
+  if [ ! -d "$log_dir" ]; then
+    mkdir -p "$log_dir"
+  fi
+
+  # Create the log file if it doesn't exist
+  if [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE"
+  fi
+
+  echo "$timestamp - [$level] $message" >> "$LOG_FILE"
+}
+
+# make our credentials available to aws cli
+export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
+export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
+export AWS_DEFAULT_OUTPUT="table"
+
+sync_to_s3() {
+  local service="$1"
+  
+  
+  if [ "$service" == "clickhouse" ]; then
+    local local_backups_dir="$LOCAL_BACKUP_PATH$LOCAL_CLICKHOUSE_PATH"
+    local s3_path="$S3_CLICKHOUSE_PATH"
+    local included_files="*.zip"
+  fi
+
+  if [ "$service" == "postgres" ]; then
+    local local_backups_dir="$LOCAL_BACKUP_PATH$LOCAL_POSTGRES_PATH"
+    local s3_path="$S3_POSTGRES_PATH"
+    local included_files="*.tar"
+  fi
+
+  log_message "Starting $service backup sync to S3..."
+  output=$(aws s3 sync $local_backups_dir $s3_path --exclude "*" --include $included_files --region ${S3_BUCKET_REGION} 2>&1)
+
+  local transfer_total_files=$(echo "$output" | awk '/upload:/ {count++} END {printf "%d\n", count}')
+
+  if [ $? -eq 0 ]; then
+    log_message "$service backup sync completed successfully"
+    log_message "total files transferred: $transfer_total_files"
+  else
+    log_message "$service backup sync failed." "ERROR"
+    log_message "$output" "ERROR"
+  fi
+}
+
+sync_to_s3 "clickhouse"
+sync_to_s3 "postgres"

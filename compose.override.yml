@@ -1,0 +1,8 @@
+name: analytics
+services:
+  plausible_events_db:
+    volumes:
+      # Add the backups config file
+      - ./clickhouse/backups.xml:/etc/clickhouse-server/config.d/backups.xml:ro
+      # Add a volume for storing backups
+      - ./backups/clickhouse-data:/backups

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+
+# *This file is meant to be run as root or with sudo*
+# It will restore the ClickHouse database from a backup file
+
+# confirm that user is root or sudo, if not exit
+if [ "$EUID" -ne 0 ]
+  then echo "Please run as root or with sudo"
+  exit
+fi
+
+# Get the directory of the script
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+# Get the dir 1 level up
+DIR="$(dirname "$DIR")"
+
+# Load the environment variables
+source "$DIR/.env"
+
+REQUIRED_VARS=(
+  LOCAL_BACKUP_PATH
+  LOCAL_CLICKHOUSE_BACKUP_PATH
+  LOGS_PATH
+)
+
+for var in "${REQUIRED_VARS[@]}"; do
+  if [ -z "${!var}" ] || [ "${!var}" = "REPLACE_ME" ]; then
+    echo "$var is unset. Please set this in your .env file." 
+    exit 1
+  fi
+done
+
+# log file + backup path
+LOG_FILE="${LOGS_PATH}plausible-restore-clickhouse-data.log"
+BACKUP_PATH=${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH}
+
+# function to log messages
+log_message() {
+  local log_dir=$(dirname "$LOG_FILE")
+  local log_file=$(basename "$LOG_FILE")
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  local message="${1//[$'\n']/}" # Remove newline characters from the message
+  local level="${2:-INFO}" # Optional log level
+
+  # Create the log directory if it doesn't exist
+  if [ ! -d "$log_dir" ]; then
+    mkdir -p "$log_dir"
+  fi
+
+  # Create the log file if it doesn't exist
+  if [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE"
+  fi
+
+  echo "$timestamp - [$level] $message" >> "$LOG_FILE"
+}
+
+# Define the container name
+# Look for CLICKHOUSE_CONTAINER_NAME and set to default if not found
+if [ -z ${CLICKHOUSE_CONTAINER_NAME+x} ]; then
+    CLICKHOUSE_CONTAINER_NAME="analytics-plausible_events_db-1"
+fi
+
+CONTAINER_NAME=${CLICKHOUSE_CONTAINER_NAME}
+
+# Check if backup file is provided as argument
+if [ -z "$1" ]; then
+    # No argument provided, list available backups and prompt user
+    echo "Available ClickHouse backups in ${BACKUP_PATH}:"
+    echo "----------------------------------------"
+    ls -lh ${BACKUP_PATH}*.zip 2>/dev/null | awk '{print $9, "(" $5 ")"}'
+    
+    if [ $? -ne 0 ] || [ -z "$(ls -A ${BACKUP_PATH}*.zip 2>/dev/null)" ]; then
+        echo "No backup files found in ${BACKUP_PATH}"
+        log_message "No backup files found in ${BACKUP_PATH}" "ERROR"
+        exit 1
+    fi
+    
+    echo ""
+    echo "Usage: $0 <backup_file>"
+    echo "Example: $0 ${BACKUP_PATH}plausible_events_db_backup_2024-01-15-10-30-00.zip"
+    exit 1
+fi
+
+BACKUP_FILE="$1"
+
+# Validate backup file exists
+if [ ! -f "$BACKUP_FILE" ]; then
+    echo "Backup file not found: $BACKUP_FILE"
+    log_message "Backup file not found: $BACKUP_FILE" "ERROR"
+    exit 1
+fi
+
+# Extract just the filename for logging
+BACKUP_FILENAME=$(basename "$BACKUP_FILE")
+
+log_message "Starting restore of ClickHouse database from backup: $BACKUP_FILENAME"
+
+# Confirmation prompt
+echo "⚠️  WARNING: This will restore the Plausible ClickHouse database from backup."
+echo "Database: plausible_events_db"
+echo "Backup file: $BACKUP_FILENAME"
+echo ""
+read -p "Are you sure you want to proceed? (yes/no): " CONFIRM
+
+if [ "$CONFIRM" != "yes" ]; then
+    echo "Restore cancelled by user."
+    log_message "Restore cancelled by user." "INFO"
+    exit 0
+fi
+
+# Copy the backup file into the Docker container
+log_message "Copying backup file $BACKUP_FILENAME to Docker container."
+docker cp "$BACKUP_FILE" $CONTAINER_NAME:/backups/restore.zip
+
+if [ $? -ne 0 ]; then
+    log_message "Failed to copy backup file to container." "ERROR"
+    echo "Failed to copy backup file to container."
+    exit 1
+fi
+
+# Drop the existing database (if it exists)
+log_message "Dropping existing plausible_events_db database."
+docker exec $CONTAINER_NAME clickhouse-client --query "DROP DATABASE IF EXISTS plausible_events_db;"
+
+if [ $? -ne 0 ]; then
+    log_message "Failed to drop database." "ERROR"
+    echo "Failed to drop database."
+    exit 1
+fi
+
+# Restore from the backup file using ClickHouse's native RESTORE command
+log_message "Restoring database from backup file."
+docker exec $CONTAINER_NAME clickhouse-client --query "RESTORE DATABASE plausible_events_db FROM Disk('backups', 'restore.zip');"
+
+if [ $? -ne 0 ]; then
+    log_message "Failed to restore database from backup." "ERROR"
+    echo "Failed to restore database from backup."
+    exit 1
+fi
+
+# Clean up the restore file from inside the Docker container
+log_message "Removing restore file from Docker container."
+docker exec $CONTAINER_NAME /bin/bash -c "rm /backups/restore.zip"
+
+# Verify the database was restored successfully
+log_message "Verifying database restoration."
+TABLE_COUNT=$(docker exec $CONTAINER_NAME clickhouse-client --query "SELECT count() FROM system.tables WHERE database = 'plausible_events_db';" 2>/dev/null)
+
+if [ -z "$TABLE_COUNT" ] || [ "$TABLE_COUNT" -eq 0 ]; then
+    log_message "Database restored but no tables found. This may indicate a problem." "WARNING"
+    echo "⚠️  Database restored but no tables found. Please verify the backup file."
+else
+    log_message "Successfully restored the Plausible ClickHouse database with $TABLE_COUNT tables from $BACKUP_FILENAME."
+    echo "✅ Successfully restored the Plausible ClickHouse database with $TABLE_COUNT tables from $BACKUP_FILENAME."
+fi

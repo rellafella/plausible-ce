@@ -1,97 +1,38 @@
-<p align="center">
+<div align="center">
     <picture>
         <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/plausible/community-edition/refs/heads/v2.1.1/images/logo_dark.svg" width="300">
         <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/plausible/community-edition/refs/heads/v2.1.1/images/logo_light.svg" width="300">
         <img src="https://raw.githubusercontent.com/plausible/community-edition/refs/heads/v2.1.1/images/logo_light.svg" width="300">
     </picture>
-</p>
+</div>
 
-<p align="center">
-    A getting started guide to self-hosting <a href="https://plausible.io/blog/community-edition">Plausible Community Edition</a>
-</p>
+[![Laravel Forge Site Deployment Status](https://img.shields.io/endpoint?url=https%3A%2F%2Fforge.laravel.com%2Fsite-badges%2Ff1b67638-81af-47d0-a9e9-2c480c5b0b14&style=plastic)](https://forge.laravel.com/servers/825593/sites/2413935)
 
 ---
 
-### Prerequisites
+This repo is a fork of Plausible's Community Edition repo,[https://github.com/plausible/community-edition](https://github.com/plausible/community-edition).
 
-- **[Docker](https://docs.docker.com/engine/install/)** and **[Docker Compose](https://docs.docker.com/compose/install/)** must be installed on your machine.
-- **CPU** must support **SSE 4.2** or **NEON** instruction set or higher (required by ClickHouse).
-- At least **2 GB of RAM** is recommended for running ClickHouse and Plausible without fear of OOMs.
+Based off of John Morton's [`plausible-with-traefik-update-for-laravel-forge`](https://github.com/johnfmorton/plausible-with-traefik-update-for-laravel-forge) repo, but updated to work with the current itteration of Plausible Community Edition.
 
-### Quick start
+It contains modifications to the original repo to make it work with Laravel Forge and Traefik. Modifications are primarily in the [`compose.prod.yml`](compose.prod.yml) file. Use `.env` for environmental variables. Using the `.env` file allows you to use Laravel Forge's built-in environmental variables editor.
 
-#### 1. Clone this repository
+Keeping to the modular config of clickhouse there has been a [`clickhouse/backups.xml`](clickhouse/backups.xml)
 
-```console
-$ git clone -b v3.2.0 --single-branch https://github.com/plausible/community-edition plausible-ce
-Cloning into 'plausible-ce'...
+## Laravel Forge Deployment script
 
-$ cd plausible-ce
+Here is a basic version of the deployment script. a couple of assumptions are made, docker and docker compose are installed use the [`scripts/forge-recipe-install-docker`](scripts/forge-recipe-install-docker) script if it's not already installed.
 
-$ ls -1
-clickhouse/
-compose.yml
-LICENSE
-README.md
+```bash
+cd /home/forge/REPLACE_ME
+
+git pull origin $FORGE_SITE_BRANCH
+
+make prod
 ```
 
-#### 2. Create and configure your [environment](https://docs.docker.com/compose/environment-variables/) file
+## Reference links
 
-```console
-$ touch .env
-$ echo "BASE_URL=https://plausible.example.com" >> .env
-$ echo "SECRET_KEY_BASE=$(openssl rand -base64 48)" >> .env
-
-$ cat .env
-BASE_URL=https://plausible.example.com
-SECRET_KEY_BASE=...unique secret key base...
-```
-
-Make sure `$BASE_URL` is set to the **actual domain** where you plan to host the service. The domain must have a DNS entry pointing to your server for proper resolution and automatic Let's Encrypt TLS certificate issuance. More on that in the next step.
-
-Also ensure `$SECRET_KEY_BASE` is set to at least a **64-byte** string.
-
-> [!TIP]
-> To evaluate CE locally, set `BASE_URL=http://localhost:8000` (or any other port on your system).
-
-#### 3. Expose Plausible server to the web with a [compose override file:](https://github.com/plausible/community-edition/wiki/compose-override)
-
-```sh
-$ echo "HTTP_PORT=80" >> .env
-$ echo "HTTPS_PORT=443" >> .env
-
-$ cat > compose.override.yml << EOF
-services:
-    plausible:
-        ports:
-            - 80:80
-            - 443:443
-EOF
-```
-
-Setting `HTTP_PORT=80` and `HTTPS_PORT=443` enables automatic Let's Encrypt TLS certificate issuance. You might want to choose different values if, for example, you plan to run Plausible behind [a reverse proxy.](https://github.com/plausible/community-edition/wiki/reverse-proxy)
-
-> [!TIP]
-> To evaluate CE locally, you only need to set `HTTP_PORT` and expose it on the system port from the previous step, e.g. for `BASE_URL=http://localhost:8000` and server `HTTP_PORT=80`, `ports` override should be `- 8000:80`.
-
-#### 4. Start the services with Docker Compose:
-
-```console
-$ docker compose up -d
-```
-
-#### 5. Visit your instance at `$BASE_URL` and create the first user.
-
-> [!NOTE]
-> Plausible CE is funded by our cloud subscribers.
->
-> If you know someone who might [find Plausible useful](https://plausible.io/?utm_medium=Social&utm_source=GitHub&utm_campaign=readme), we'd appreciate if you'd let them know.
-
-### Wiki
-
-For more information on installation, upgrades, configuration, and integrations please see our [wiki.](https://github.com/plausible/community-edition/wiki)
-
-### Contact
-
-- For release announcements please go to [GitHub releases.](https://github.com/plausible/analytics/releases)
-- For a question or advice please go to [GitHub discussions.](https://github.com/plausible/analytics/discussions/categories/self-hosted-support)
+- https://github.com/johnfmorton/plausible-with-traefik-update-for-laravel-forge
+- https://putyourlightson.com/articles/replacing-google-analytics-with-self-hosted-analytics
+- https://plausible.io/docs/self-hosting
+- https://www.digitalocean.com/community/tutorials/how-to-use-traefik-as-a-reverse-proxy-for-docker-containers-on-ubuntu-20-04
