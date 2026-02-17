@@ -24,6 +24,7 @@ REQUIRED_VARS=(
   LOCAL_POSTGRES_BACKUP_PATH
   LOCAL_CLICKHOUSE_BACKUP_PATH
   LOCAL_BACKUP_RETENTION_DAYS
+  S3_BACKUP_RETENTION_DAYS
   S3_BUCKET_NAME
   S3_BUCKET_REGION
   S3_ACCESS_KEY_ID
@@ -101,5 +102,35 @@ sync_to_s3() {
   fi
 }
 
+prune_s3_backups() {
+  local service="$1"
+  local s3_path="$2"
+  
+  log_message "Pruning old $service backups from S3 (retention: ${S3_BACKUP_RETENTION_DAYS} days)..."
+  
+  local cutoff_date=$(date -d "-${S3_BACKUP_RETENTION_DAYS} days" +%s 2>/dev/null || date -v-${S3_BACKUP_RETENTION_DAYS}d +%s)
+  local deleted_count=0
+  
+  aws s3 ls $s3_path --region ${S3_BUCKET_REGION} | while read -r line; do
+    local file_date=$(echo $line | awk '{print $1" "$2}')
+    local file_name=$(echo $line | awk '{print $4}')
+    
+    if [ -n "$file_name" ]; then
+      local file_timestamp=$(date -d "$file_date" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$file_date" +%s)
+      
+      if [ $file_timestamp -lt $cutoff_date ]; then
+        log_message "Deleting old backup: $file_name"
+        aws s3 rm "${s3_path}${file_name}" --region ${S3_BUCKET_REGION}
+        ((deleted_count++))
+      fi
+    fi
+  done
+  
+  log_message "Pruned $deleted_count old $service backup(s) from S3"
+}
+
 sync_to_s3 "clickhouse"
+prune_s3_backups "clickhouse" "$S3_CLICKHOUSE_PATH"
+
 sync_to_s3 "postgres"
+prune_s3_backups "postgres" "$S3_POSTGRES_PATH"
