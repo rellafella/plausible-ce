@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+DIR="$(dirname "$DIR")"
+
+source "$DIR/.env"
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+confirm-root-user() {
+  if [ "$EUID" -ne 0 ]; then
+    echo "This script needs to be run as root or with sudo."
+    exit 1
+  fi
+}
+
+log_message() {
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  local message="${1//[$'\n']/}"
+  local level="${2:-INFO}"
+  local log_dir=$(dirname "$LOG_FILE")
+
+  mkdir -p "$log_dir"
+  touch "$LOG_FILE"
+  echo "$timestamp - [$level] $message" >> "$LOG_FILE"
+}
+
+check-required-vars() {
+  for var in "$@"; do
+    if [ -z "${!var}" ] || [ "${!var}" = "REPLACE_ME" ]; then
+      echo "$var is unset. Please set this in your .env file."
+      exit 1
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+backup-clickhouse-data() {
+  check-required-vars LOCAL_BACKUP_PATH LOCAL_CLICKHOUSE_BACKUP_PATH LOGS_PATH
+
+  LOG_FILE="${LOGS_PATH}plausible-backup-clickhouse-data.log"
+  local backup_path="${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH}"
+  local container="${CLICKHOUSE_CONTAINER_NAME:-analytics-plausible_events_db-1}"
+  local retention="${LOCAL_BACKUP_RETENTION_DAYS:-7}"
+  local timestamp=$(date +%Y-%m-%d-%H-%M-%S)
+
+  mkdir -p "$backup_path"
+
+  docker exec "$container" clickhouse-client --query \
+    "BACKUP DATABASE plausible_events_db TO Disk('backups', 'plausible_events_db_backup_${timestamp}.zip')"
+
+  log_message "Copying plausible_events_db_backup_${timestamp}.zip from container to ${backup_path}."
+  docker cp "$container:/backups/plausible_events_db_backup_${timestamp}.zip" \
+    "${backup_path}plausible_events_db_backup_${timestamp}.zip"
+
+  if [ $? -ne 0 ]; then
+    log_message "Failed to copy ClickHouse backup." "ERROR"; exit 1
+  fi
+
+  docker exec "$container" /bin/bash -c "rm ./backups/plausible_events_db_backup_${timestamp}.zip"
+
+  log_message "Pruning ClickHouse backups older than ${retention} days."
+  find "$backup_path" -type f -mtime +"$retention" -exec rm {} \;
+
+  chown -R "${LOCAL_USER:-forge}:${LOCAL_GROUP:-forge}" "$LOCAL_BACKUP_PATH"
+
+  if [ $? -eq 0 ]; then
+    log_message "Successfully backed up ClickHouse to ${backup_path}."
+  else
+    log_message "Failed to set ownership on backup directory." "ERROR"; exit 1
+  fi
+}
+
+backup-postgres() {
+  check-required-vars LOCAL_BACKUP_PATH LOCAL_POSTGRES_BACKUP_PATH LOGS_PATH
+
+  LOG_FILE="${LOGS_PATH}plausible-backup-postgres.log"
+  local backup_path="${LOCAL_BACKUP_PATH}${LOCAL_POSTGRES_BACKUP_PATH}"
+  local container="${POSTGRES_CONTAINER_NAME:-analytics-plausible_db-1}"
+  local retention="${LOCAL_BACKUP_RETENTION_DAYS:-7}"
+  local timestamp=$(date +%Y-%m-%d-%H-%M-%S)
+
+  mkdir -p "$backup_path"
+
+  docker exec "$container" /bin/bash -c \
+    "mkdir -p /var/lib/postgresql/backups/ && PGPASSWORD=postgres pg_dump -h localhost -p 5432 -U postgres -F t -b -v -f /var/lib/postgresql/backups/plausible_db_backup_${timestamp}.tar plausible_db"
+
+  log_message "Copying plausible_db_backup_${timestamp}.tar from container to ${backup_path}."
+  docker cp "$container:/var/lib/postgresql/backups/plausible_db_backup_${timestamp}.tar" "$backup_path"
+
+  log_message "Removing plausible_db_backup_${timestamp}.tar from container."
+  docker exec "$container" /bin/bash -c "rm /var/lib/postgresql/backups/plausible_db_backup_${timestamp}.tar"
+
+  log_message "Pruning Postgres backups older than ${retention} days."
+  find "$backup_path" -type f -mtime +"$retention" -exec rm {} \;
+
+  chown -R "${LOCAL_USER:-forge}:${LOCAL_GROUP:-forge}" "$LOCAL_BACKUP_PATH"
+
+  if [ $? -eq 0 ]; then
+    log_message "Successfully backed up Postgres to ${backup_path}."
+  else
+    log_message "Failed to set ownership on backup directory." "ERROR"; exit 1
+  fi
+}
+
+backup-to-s3() {
+  check-required-vars LOCAL_BACKUP_PATH LOCAL_POSTGRES_BACKUP_PATH LOCAL_CLICKHOUSE_BACKUP_PATH \
+    LOCAL_BACKUP_RETENTION_DAYS S3_BACKUP_RETENTION_DAYS S3_BUCKET_NAME S3_BUCKET_REGION \
+    S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY LOGS_PATH
+
+  LOG_FILE="${LOGS_PATH}plausible-backup-to-s3.log"
+
+  export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
+  export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
+  export AWS_DEFAULT_OUTPUT="table"
+
+  local s3_clickhouse="s3://${S3_BUCKET_NAME}/plausible/clickhouse-data/"
+  local s3_postgres="s3://${S3_BUCKET_NAME}/plausible/postgres-data/"
+
+  _sync_to_s3() {
+    local service="$1" local_dir s3_path pattern
+    if [ "$service" = "clickhouse" ]; then
+      local_dir="${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH}"
+      s3_path="$s3_clickhouse"; pattern="*.zip"
+    else
+      local_dir="${LOCAL_BACKUP_PATH}${LOCAL_POSTGRES_BACKUP_PATH}"
+      s3_path="$s3_postgres"; pattern="*.tar"
+    fi
+
+    log_message "Starting $service sync to S3."
+    local output
+    output=$(aws s3 sync "$local_dir" "$s3_path" --exclude "*" --include "$pattern" --region "$S3_BUCKET_REGION" 2>&1)
+    local count=$(echo "$output" | awk '/upload:/ {count++} END {printf "%d\n", count}')
+
+    if [ $? -eq 0 ]; then
+      log_message "$service sync completed. Files transferred: $count"
+    else
+      log_message "$service sync failed." "ERROR"
+      log_message "$output" "ERROR"
+    fi
+  }
+
+  _prune_s3() {
+    local service="$1" s3_path="$2"
+    local cutoff=$(date -d "-${S3_BACKUP_RETENTION_DAYS} days" +%s 2>/dev/null || date -v-${S3_BACKUP_RETENTION_DAYS}d +%s)
+
+    log_message "Pruning $service S3 backups older than ${S3_BACKUP_RETENTION_DAYS} days."
+    aws s3 ls "$s3_path" --region "$S3_BUCKET_REGION" | while read -r line; do
+      local file_date file_name file_ts
+      file_date=$(echo "$line" | awk '{print $1" "$2}')
+      file_name=$(echo "$line" | awk '{print $4}')
+      [ -z "$file_name" ] && continue
+      file_ts=$(date -d "$file_date" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$file_date" +%s)
+      if [ "$file_ts" -lt "$cutoff" ]; then
+        log_message "Deleting $file_name"
+        aws s3 rm "${s3_path}${file_name}" --region "$S3_BUCKET_REGION"
+      fi
+    done
+  }
+
+  _sync_to_s3 "clickhouse"
+  _prune_s3 "clickhouse" "$s3_clickhouse"
+  _sync_to_s3 "postgres"
+  _prune_s3 "postgres" "$s3_postgres"
+}
+
+restore-clickhouse-data() {
+  check-required-vars LOCAL_BACKUP_PATH LOCAL_CLICKHOUSE_BACKUP_PATH LOGS_PATH
+
+  LOG_FILE="${LOGS_PATH}plausible-restore-clickhouse-data.log"
+  local backup_path="${LOCAL_BACKUP_PATH}${LOCAL_CLICKHOUSE_BACKUP_PATH}"
+  local container="${CLICKHOUSE_CONTAINER_NAME:-analytics-plausible_events_db-1}"
+
+  if [ -z "$1" ]; then
+    echo "Available ClickHouse backups in ${backup_path}:"
+    echo "----------------------------------------"
+    ls -lh "${backup_path}"*.zip 2>/dev/null | awk '{print $9, "(" $5 ")"}'
+    echo ""
+    echo "Usage: $0 restore clickhouse <backup_file>"
+    exit 1
+  fi
+
+  local backup_file="$1"
+  if [ ! -f "$backup_file" ]; then
+    echo "Backup file not found: $backup_file"; exit 1
+  fi
+
+  local backup_filename=$(basename "$backup_file")
+  log_message "Starting ClickHouse restore from: $backup_filename"
+
+  echo "⚠️  WARNING: This will restore plausible_events_db from backup."
+  echo "Backup file: $backup_filename"
+  echo ""
+  read -p "Are you sure you want to proceed? (yes/no): " CONFIRM
+  [ "$CONFIRM" != "yes" ] && { echo "Restore cancelled."; log_message "Restore cancelled by user."; exit 0; }
+
+  docker cp "$backup_file" "$container:/backups/restore.zip" || { log_message "Failed to copy backup to container." "ERROR"; exit 1; }
+
+  log_message "Dropping existing plausible_events_db."
+  docker exec "$container" clickhouse-client --query "DROP DATABASE IF EXISTS plausible_events_db;" || { log_message "Failed to drop database." "ERROR"; exit 1; }
+
+  log_message "Restoring from backup."
+  docker exec "$container" clickhouse-client --query "RESTORE DATABASE plausible_events_db FROM Disk('backups', 'restore.zip');" || { log_message "Failed to restore database." "ERROR"; exit 1; }
+
+  docker exec "$container" /bin/bash -c "rm /backups/restore.zip"
+
+  local table_count
+  table_count=$(docker exec "$container" clickhouse-client --query "SELECT count() FROM system.tables WHERE database = 'plausible_events_db';" 2>/dev/null)
+
+  if [ -z "$table_count" ] || [ "$table_count" -eq 0 ]; then
+    log_message "Restored but no tables found — verify the backup file." "WARNING"
+    echo "⚠️  Restored but no tables found. Please verify the backup file."
+  else
+    log_message "Successfully restored ClickHouse with $table_count tables from $backup_filename."
+    echo "✅ Successfully restored ClickHouse with $table_count tables."
+  fi
+}
+
+restore-postgres() {
+  check-required-vars LOCAL_BACKUP_PATH LOCAL_POSTGRES_BACKUP_PATH LOGS_PATH
+
+  LOG_FILE="${LOGS_PATH}plausible-restore-postgres.log"
+  local backup_path="${LOCAL_BACKUP_PATH}${LOCAL_POSTGRES_BACKUP_PATH}"
+  local container="${POSTGRES_CONTAINER_NAME:-analytics-plausible_db-1}"
+
+  if [ -z "$1" ]; then
+    echo "Available PostgreSQL backups in ${backup_path}:"
+    echo "----------------------------------------"
+    ls -lh "${backup_path}"*.tar 2>/dev/null | awk '{print $9, "(" $5 ")"}'
+    echo ""
+    echo "Usage: $0 restore postgres <backup_file>"
+    exit 1
+  fi
+
+  local backup_file="$1"
+  if [ ! -f "$backup_file" ]; then
+    echo "Backup file not found: $backup_file"; exit 1
+  fi
+
+  local backup_filename=$(basename "$backup_file")
+  log_message "Starting Postgres restore from: $backup_filename"
+
+  echo "⚠️  WARNING: This will restore plausible_db from backup."
+  echo "Backup file: $backup_filename"
+  echo ""
+  read -p "Are you sure you want to proceed? (yes/no): " CONFIRM
+  [ "$CONFIRM" != "yes" ] && { echo "Restore cancelled."; log_message "Restore cancelled by user."; exit 0; }
+
+  docker exec "$container" /bin/bash -c "mkdir -p /var/lib/postgresql/restores/"
+  docker cp "$backup_file" "$container:/var/lib/postgresql/restores/restore.tar" || { log_message "Failed to copy backup to container." "ERROR"; exit 1; }
+
+  log_message "Terminating existing connections to plausible_db."
+  docker exec "$container" /bin/bash -c "PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d postgres <<EOF
+REVOKE CONNECT ON DATABASE plausible_db FROM public;
+ALTER DATABASE plausible_db ALLOW_CONNECTIONS false;
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'plausible_db' AND pid <> pg_backend_pid();
+EOF
+"
+  sleep 2
+
+  log_message "Dropping existing plausible_db."
+  docker exec "$container" /bin/bash -c "PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d postgres -c 'DROP DATABASE IF EXISTS plausible_db;'" || { log_message "Failed to drop database." "ERROR"; exit 1; }
+
+  log_message "Creating plausible_db."
+  docker exec "$container" /bin/bash -c "PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d postgres -c 'CREATE DATABASE plausible_db;'" || { log_message "Failed to create database." "ERROR"; exit 1; }
+
+  log_message "Restoring from backup."
+  docker exec "$container" /bin/bash -c "PGPASSWORD=postgres pg_restore -h localhost -p 5432 -U postgres -d plausible_db -v /var/lib/postgresql/restores/restore.tar" || { log_message "Failed to restore database." "ERROR"; exit 1; }
+
+  docker exec "$container" /bin/bash -c "rm /var/lib/postgresql/restores/restore.tar"
+
+  log_message "Successfully restored Postgres from $backup_filename."
+  echo "✅ Successfully restored Postgres from $backup_filename."
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+usage() {
+  echo "Usage: $0 <command> [args]"
+  echo ""
+  echo "Commands:"
+  echo "  backup clickhouse          Back up ClickHouse data"
+  echo "  backup postgres            Back up Postgres"
+  echo "  backup s3                  Sync local backups to S3"
+  echo "  restore clickhouse <file>  Restore ClickHouse from backup file"
+  echo "  restore postgres <file>    Restore Postgres from backup file"
+}
+
+main() {
+  confirm-root-user
+
+  local cmd="$1"
+  local target="$2"
+  shift 2 2>/dev/null
+
+  case "$cmd:$target" in
+    backup:clickhouse)   backup-clickhouse-data ;;
+    backup:postgres)     backup-postgres ;;
+    backup:s3)           backup-to-s3 ;;
+    restore:clickhouse)  restore-clickhouse-data "$@" ;;
+    restore:postgres)    restore-postgres "$@" ;;
+    *)                   usage; exit 1 ;;
+  esac
+}
+
+main "$@"
