@@ -30,6 +30,22 @@ git pull origin $FORGE_SITE_BRANCH
 make prod
 ```
 
+## Operations script
+
+Use the unified [`scripts/plausible`](scripts/plausible) command for backups,
+restores, and S3 syncs:
+
+```bash
+sudo ./scripts/plausible backup clickhouse
+sudo ./scripts/plausible backup postgres
+sudo ./scripts/plausible backup s3
+sudo ./scripts/plausible restore clickhouse /path/to/backup.zip
+sudo ./scripts/plausible restore postgres /path/to/backup.tar
+```
+
+Cron jobs should call `scripts/plausible` directly instead of the old standalone
+backup and restore scripts.
+
 ## Reference links
 
 - https://github.com/johnfmorton/plausible-with-traefik-update-for-laravel-forge

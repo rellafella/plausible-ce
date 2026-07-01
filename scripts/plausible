@@ -51,21 +51,36 @@ backup-clickhouse-data() {
 
   mkdir -p "$backup_path"
 
-  docker exec "$container" clickhouse-client --query \
-    "BACKUP DATABASE plausible_events_db TO Disk('backups', 'plausible_events_db_backup_${timestamp}.zip')"
+  local backup_file="plausible_events_db_backup_${timestamp}.zip"
+  local container_backup_file="/backups/${backup_file}"
+  local host_backup_file="${backup_path}${backup_file}"
+  local output
 
-  log_message "Copying plausible_events_db_backup_${timestamp}.zip from container to ${backup_path}."
-  docker cp "$container:/backups/plausible_events_db_backup_${timestamp}.zip" \
-    "${backup_path}plausible_events_db_backup_${timestamp}.zip"
-
+  output=$(docker exec "$container" clickhouse-client --query \
+    "BACKUP DATABASE plausible_events_db TO Disk('backups', '${backup_file}')" 2>&1)
   if [ $? -ne 0 ]; then
-    log_message "Failed to copy ClickHouse backup." "ERROR"; exit 1
+    log_message "Failed to create ClickHouse backup: $output" "ERROR"; exit 1
   fi
 
-  docker exec "$container" /bin/bash -c "rm ./backups/plausible_events_db_backup_${timestamp}.zip"
+  if [ -f "$host_backup_file" ]; then
+    log_message "Successfully created ClickHouse backup at ${host_backup_file}."
+  else
+    log_message "Copying ${backup_file} from container to ${backup_path}."
+    output=$(docker cp "${container}:${container_backup_file}" "$host_backup_file" 2>&1)
+
+    if [ $? -ne 0 ]; then
+      log_message "Failed to copy ClickHouse backup: $output" "ERROR"; exit 1
+    fi
+
+    docker exec "$container" rm -f "$container_backup_file"
+  fi
+
+  if [ ! -s "$host_backup_file" ]; then
+    log_message "Backup file ${host_backup_file} was not found or is empty after backup." "ERROR"; exit 1
+  fi
 
   log_message "Pruning ClickHouse backups older than ${retention} days."
-  find "$backup_path" -type f -mtime +"$retention" -exec rm {} \;
+  find "$backup_path" -type f -name 'plausible_events_db_backup_*.zip' -mtime +"$retention" -exec rm {} \;
 
   chown -R "${LOCAL_USER:-forge}:${LOCAL_GROUP:-forge}" "$LOCAL_BACKUP_PATH"
 
@@ -132,17 +147,25 @@ backup-to-s3() {
       s3_path="$s3_postgres"; pattern="*.tar"
     fi
 
+    if ! compgen -G "${local_dir}${pattern}" > /dev/null; then
+      log_message "No local $service backup files found in $local_dir. Skipping S3 sync and prune." "ERROR"
+      return 1
+    fi
+
     log_message "Starting $service sync to S3."
     local output
     output=$(aws s3 sync "$local_dir" "$s3_path" --exclude "*" --include "$pattern" --region "$S3_BUCKET_REGION" 2>&1)
+    local sync_status=$?
     local count=$(echo "$output" | awk '/upload:/ {count++} END {printf "%d\n", count}')
 
-    if [ $? -eq 0 ]; then
+    if [ $sync_status -eq 0 ]; then
       log_message "$service sync completed. Files transferred: $count"
     else
       log_message "$service sync failed." "ERROR"
       log_message "$output" "ERROR"
     fi
+
+    return $sync_status
   }
 
   _prune_s3() {
@@ -163,10 +186,17 @@ backup-to-s3() {
     done
   }
 
-  _sync_to_s3 "clickhouse"
-  _prune_s3 "clickhouse" "$s3_clickhouse"
-  _sync_to_s3 "postgres"
-  _prune_s3 "postgres" "$s3_postgres"
+  if _sync_to_s3 "clickhouse"; then
+    _prune_s3 "clickhouse" "$s3_clickhouse"
+  else
+    log_message "Skipping ClickHouse S3 prune because sync did not complete." "ERROR"
+  fi
+
+  if _sync_to_s3 "postgres"; then
+    _prune_s3 "postgres" "$s3_postgres"
+  else
+    log_message "Skipping Postgres S3 prune because sync did not complete." "ERROR"
+  fi
 }
 
 restore-clickhouse-data() {
