@@ -58,17 +58,6 @@ tail -n 200 logs/plausible-backup-to-s3.log
 Logs are also echoed to stderr by default so manual Forge/SSH runs show failures
 immediately. Set `PLAUSIBLE_LOG_STDERR=0` to only write to log files.
 
-If ClickHouse reports `Cannot open file /backups/*.zip.lock: Permission denied`,
-the host backup directory is not writable by the ClickHouse container user. On
-the production server, fix it with:
-
-```bash
-CH_CONTAINER=$(docker ps --filter label=com.docker.compose.service=plausible_events_db --format '{{.Names}}' | head -n 1)
-CH_UID_GID=$(docker exec "$CH_CONTAINER" sh -c 'printf "%s:%s" "$(id -u clickhouse)" "$(id -g clickhouse)"')
-sudo mkdir -p /home/forge/analytics/backups/clickhouse-data
-sudo chown -R "$CH_UID_GID" /home/forge/analytics/backups/clickhouse-data
-```
-
 ## Reference links
 
 - https://github.com/johnfmorton/plausible-with-traefik-update-for-laravel-forge
