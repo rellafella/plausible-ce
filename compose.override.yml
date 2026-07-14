@@ -1,5 +1,9 @@
 name: analytics
 services:
+  plausible:
+    environment:
+      SENTRY_DSN: ${SENTRY_DSN}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
   plausible_events_db:
     volumes:
       # Add the backups config file
